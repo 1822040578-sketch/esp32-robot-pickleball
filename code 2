@@ -1,0 +1,189 @@
+#include <PS2X_lib.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= PS2 pins =================
+#define PS2_CLK  18
+#define PS2_CMD  23
+#define PS2_SEL   5
+#define PS2_DAT  19
+PS2X ps2x;
+
+// ================= BTS 4 BÁNH =================
+#define M1_RPWM   21
+#define M1_LPWM   22 
+#define M1_REN    15
+#define M1_LEN    0
+
+#define M2_RPWM   25
+#define M2_LPWM   26
+#define M2_REN    27
+#define M2_LEN    14
+
+#define M3_RPWM 32
+#define M3_LPWM 33
+#define M3_REN  12
+#define M3_LEN  13
+
+#define M4_RPWM  16
+#define M4_LPWM  17
+#define M4_REN   2
+#define M4_LEN   4
+
+const int PWM_FREQ = 15000;
+const int PWM_RES  = 8;
+const int MAX_SPEED = 220;
+
+// ================= ESP-NOW =================
+uint8_t esp2Mac[] = {0x44, 0x1D, 0x64, 0xE8, 0x90, 0x00};
+
+// Cập nhật struct để thêm nút X (PSB_CROSS)
+typedef struct {
+  uint8_t r1Mode;     // 0–3
+  uint8_t l1Toggle;   // 0/1 cho servo 1
+  uint8_t xHold;      // 1 = đang ấn giữ nút X, 0 = thả
+  uint8_t l2Hold;     // <-- THÊM
+  uint8_t r2Hold;     // <-- THÊM
+} DataSend;
+
+DataSend txData;
+
+// ================= DRIVE BTS =================
+void driveBTS(int rpwm_pin, int lpwm_pin, int speed) {
+  speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
+  if (speed > 0) {
+    ledcWrite(rpwm_pin, speed);
+    ledcWrite(lpwm_pin, 0);
+  } else if (speed < 0) {
+    ledcWrite(rpwm_pin, 0);
+    ledcWrite(lpwm_pin, -speed);
+  } else {
+    ledcWrite(rpwm_pin, 0);
+    ledcWrite(lpwm_pin, 0);
+  }
+}
+
+// ================= BIẾN QUẢN LÝ NÚT =================
+uint8_t r1Mode = 0;
+bool lastR1 = false;
+
+uint8_t l1Toggle = 0;
+bool lastL1 = false;
+
+// Thêm cho nút X
+bool lastX = false;  // Để debounce (chỉ phát hiện thay đổi)
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("ESP32 #1 MECANUM + PS2 + ESP-NOW + Servo X (nút X)");
+
+  // ===== PWM =====
+  ledcAttach(M1_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_LPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_LPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M3_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M3_LPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M4_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(M4_LPWM, PWM_FREQ, PWM_RES);
+
+  pinMode(M1_REN, OUTPUT); digitalWrite(M1_REN, HIGH);
+  pinMode(M1_LEN, OUTPUT); digitalWrite(M1_LEN, HIGH);
+  pinMode(M2_REN, OUTPUT); digitalWrite(M2_REN, HIGH);
+  pinMode(M2_LEN, OUTPUT); digitalWrite(M2_LEN, HIGH);
+  pinMode(M3_REN, OUTPUT); digitalWrite(M3_REN, HIGH);
+  pinMode(M3_LEN, OUTPUT); digitalWrite(M3_LEN, HIGH);
+  pinMode(M4_REN, OUTPUT); digitalWrite(M4_REN, HIGH);
+  pinMode(M4_LEN, OUTPUT); digitalWrite(M4_LEN, HIGH);
+
+  // ===== PS2 =====
+  int error = -1;
+  while (error != 0) {
+    error = ps2x.config_gamepad(PS2_CLK, PS2_CMD, PS2_SEL, PS2_DAT, true, true);
+    delay(500);
+  }
+
+  // ===== ESP-NOW =====
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (1);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, esp2Mac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+  }
+
+  Serial.println("ESP-NOW READY");
+}
+void loop() {
+  ps2x.read_gamepad();
+
+  // ===== ĐỌC JOYSTICK =====
+  int ly = 128 - ps2x.Analog(PSS_LX);
+  int lx = 128 - ps2x.Analog(PSS_LY);
+  int rx = 128 - ps2x.Analog(PSS_RX);
+
+  if (abs(ly) < 20) ly = 0;
+  if (abs(lx) < 20) lx = 0;
+  if (abs(rx) < 20) rx = 0;
+
+  // ===== MECANUM =====
+  int y = ly;
+  int x = lx;
+  int w = rx;
+
+  int m1 = y - x - w;  // Front Right
+  int m2 = y + x - w;  // Rear  Right
+  int m3 = y + x + w;  // Front Left
+  int m4 = y - x + w;  // Rear  Left
+
+  float scaler = (float)MAX_SPEED / 127.0f;
+
+  driveBTS(M1_RPWM, M1_LPWM, m1 * scaler);
+  driveBTS(M2_RPWM, M2_LPWM, m2 * scaler);
+  driveBTS(M3_RPWM, M3_LPWM, m3 * scaler);
+  driveBTS(M4_RPWM, M4_LPWM, m4 * scaler);
+
+  // ===== R1: ĐỔI MODE =====
+  bool r1Now = ps2x.Button(PSB_R1);
+  if (r1Now && !lastR1) {
+    r1Mode++;
+    if (r1Mode > 3) r1Mode = 0;
+    Serial.print("R1 Mode: ");
+    Serial.println(r1Mode);
+  }
+  lastR1 = r1Now;
+
+  // ===== L1: TOGGLE SERVO =====
+  bool l1Now = ps2x.Button(PSB_L1);
+  if (l1Now && !lastL1) {
+    l1Toggle = !l1Toggle;
+    Serial.print("Servo 1 toggle = ");
+    Serial.println(l1Toggle);
+  }
+  lastL1 = l1Now;
+
+  // ===== NÚT X / R2 / L2 =====
+  bool xNow  = ps2x.Button(PSB_CROSS);
+  bool l2Now = ps2x.Button(PSB_L2);
+  bool r2Now = ps2x.Button(PSB_R2);
+
+  // ===== GỬI ESP-NOW =====
+  txData.r1Mode   = r1Mode;
+  txData.l1Toggle = l1Toggle;
+  txData.xHold    = xNow  ? 1 : 0;
+  txData.l2Hold   = l2Now ? 1 : 0;
+  txData.r2Hold   = r2Now ? 1 : 0;
+
+  esp_now_send(esp2Mac, (uint8_t*)&txData, sizeof(txData));
+
+  delay(25);
+}
+
+
