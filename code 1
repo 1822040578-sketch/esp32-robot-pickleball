@@ -1,0 +1,175 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <ESP32Servo.h>
+
+// ================= SERVO 1 (L1 toggle) =================
+#define SERVO_PIN 4
+Servo myServo;
+
+// ================= SERVO 2 (nút X toggle) =================
+#define SERVO_X_PIN 16
+Servo servoX;
+int currentXAngle = 0;
+
+// ================= SERVO 360 (R2/L2 hold) =================
+#define SERVO_360_PIN 17
+Servo servo360;
+
+// ================= BTS (giữ nguyên) =================
+#define BTS1_RPWM 25
+#define BTS1_LPWM 26
+#define BTS1_REN  27
+#define BTS1_LEN  14
+
+#define BTS2_RPWM 32
+#define BTS2_LPWM 33
+#define BTS2_REN  12
+#define BTS2_LEN  13
+
+#define PWM_FREQ 15000
+#define PWM_RES  8
+#define MAX_SPEED 220
+
+// ================= DATA RX =================
+typedef struct {
+  uint8_t r1Mode;
+  uint8_t l1Toggle;
+  uint8_t xHold;
+  uint8_t r2Hold;
+  uint8_t l2Hold;
+} DataRecv;
+
+DataRecv rxData;
+
+// ================= TRẠNG THÁI =================
+bool dataReceived = false;
+unsigned long lastRxTime = 0;
+const unsigned long TIMEOUT_MS = 500;
+
+uint8_t lastServoState = 255;
+uint8_t lastR1Mode = 255;
+
+bool xToggleState = true;
+uint8_t lastXState = 0;
+
+// ================= DRIVE BTS =================
+void driveBTS(int rpwm, int lpwm, int speed) {
+  speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
+  if (speed > 0) {
+    ledcWrite(rpwm, speed);
+    ledcWrite(lpwm, 0);
+  } else if (speed < 0) {
+    ledcWrite(rpwm, 0);
+    ledcWrite(lpwm, -speed);
+  } else {
+    ledcWrite(rpwm, 0);
+    ledcWrite(lpwm, 0);
+  }
+}
+
+// ================= onDataRecv =================
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == sizeof(DataRecv)) {
+    memcpy(&rxData, data, sizeof(DataRecv));
+    dataReceived = true;
+    lastRxTime = millis();
+
+    Serial.printf("RX: R1=%d | L1=%d | X=%d | R2=%d | L2=%d\n",
+                  rxData.r1Mode, rxData.l1Toggle, rxData.xHold, rxData.r2Hold, rxData.l2Hold);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(0);
+
+  servoX.setPeriodHertz(50);
+  servoX.attach(SERVO_X_PIN, 500, 2400);
+  servoX.write(180);
+  currentXAngle = 180;
+
+  servo360.setPeriodHertz(50);
+  servo360.attach(SERVO_360_PIN, 500, 2400);
+  servo360.write(90); // STOP
+
+  ledcAttach(BTS1_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(BTS1_LPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(BTS2_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(BTS2_LPWM, PWM_FREQ, PWM_RES);
+
+  pinMode(BTS1_REN, OUTPUT); digitalWrite(BTS1_REN, HIGH);
+  pinMode(BTS1_LEN, OUTPUT); digitalWrite(BTS1_LEN, HIGH);
+  pinMode(BTS2_REN, OUTPUT); digitalWrite(BTS2_REN, HIGH);
+  pinMode(BTS2_LEN, OUTPUT); digitalWrite(BTS2_LEN, HIGH);
+
+  if (esp_now_init() != ESP_OK) while (1);
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (dataReceived && (now - lastRxTime > TIMEOUT_MS)) {
+    driveBTS(BTS1_RPWM, BTS1_LPWM, 0);
+    driveBTS(BTS2_RPWM, BTS2_LPWM, 0);
+    servo360.write(90);
+    dataReceived = false;
+  }
+
+  if (!dataReceived) return;
+
+  // ==== BTS SPEED ====
+  if (rxData.r1Mode != lastR1Mode) {
+    lastR1Mode = rxData.r1Mode;
+    int speed = 0;
+    switch (lastR1Mode) {
+      case 1: speed = 60; break;
+      case 2: speed = 70; break;
+      case 3: speed = 80; break;
+      default: speed = 0;
+    }
+    driveBTS(BTS1_RPWM, BTS1_LPWM, speed);
+    driveBTS(BTS2_RPWM, BTS2_LPWM, speed);
+  }
+
+  // ==== SERVO L1 ====
+  if (rxData.l1Toggle != lastServoState) {
+    lastServoState = rxData.l1Toggle;
+    myServo.write((lastServoState == 1) ? 120 : 0);
+  }
+
+  // ==== SERVO X Toggle ====
+  if (rxData.xHold != lastXState) {
+    lastXState = rxData.xHold;
+    if (rxData.xHold == 1) {
+      xToggleState = !xToggleState;
+      servoX.write(xToggleState ? 180 : 0);
+      currentXAngle = xToggleState ? 180 : 0;
+    }
+  }
+
+  // ==== SERVO 360 R2/L2 ====
+  if (rxData.r2Hold == 1) {
+    servo360.write(120); // quay thuận
+  } else if (rxData.l2Hold == 1) {
+    servo360.write(60); // quay nghịch
+  } else {
+    servo360.write(90); // stop
+  }
+
+  delay(10);
+}
+
+
